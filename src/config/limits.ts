@@ -40,6 +40,9 @@
     // Authenticated API request budget per user per minute (all reads & writes combined).
     // 认证 API 每用户每分钟请求配额（读写合计）。
     apiRequestsPerMinute: 200,
+    // Authenticated vault import & attachment batch budget per user per minute.
+    // 认证用户数据导入与附件批量上传每分钟配额。
+    importRequestsPerMinute: 600,
     // Public (unauthenticated) request budget per IP per minute.
     // 公开（未认证）接口每 IP 每分钟请求配额。
     publicRequestsPerMinute: 60,

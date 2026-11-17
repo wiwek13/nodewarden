@@ -3,7 +3,7 @@ import { StorageService } from '../services/storage';
 import { AuthService } from '../services/auth';
 import { RateLimitService, getClientIdentifier } from '../services/ratelimit';
 import { auditRequestMetadata, writeAuditEvent, safeWriteAuditEvent } from '../services/audit-events';
-import { jsonResponse, errorResponse } from '../utils/response';
+import { jsonResponse, errorResponse, unsupportedResponse } from '../utils/response';
 import { generateUUID } from '../utils/uuid';
 import { LIMITS } from '../config/limits';
 import { isStoredApiKeyHash } from '../utils/api-key';
@@ -415,77 +415,14 @@ export async function handleRegister(request: Request, env: Env): Promise<Respon
 }
 
 // POST /api/accounts/password-hint
+// In Bitwarden's security design, password hints must only ever be dispatched
+// to the user's verified email address to preserve confidentiality. Since email
+// delivery is not supported on this instance, returning cleartext hints over an
+// unauthenticated HTTP endpoint is disabled to prevent hint exposure and user enumeration.
 export async function handleGetPasswordHint(request: Request, env: Env): Promise<Response> {
-  const storage = new StorageService(env.DB);
-  const clientIdentifier = getClientIdentifier(request);
-  if (!clientIdentifier) {
-    return errorResponse('Client IP is required', 403);
-  }
-
-  let body: { email?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return errorResponse('Invalid JSON', 400);
-  }
-
-  const email = String(body.email || '').trim().toLowerCase();
-  if (!email) {
-    return errorResponse('Email is required', 400);
-  }
-
-  const rateLimit = new RateLimitService(env.DB);
-  const minuteBudget = await rateLimit.consumeStrictBudgetWithWindow(
-    `${clientIdentifier}:password-hint`,
-    LIMITS.rateLimit.passwordHintRequestsPerMinute,
-    60
-  );
-  if (!minuteBudget.allowed) {
-    return new Response(
-      JSON.stringify({
-        error: 'Too many requests',
-        error_description: `Rate limit exceeded. Try again in ${minuteBudget.retryAfterSeconds || 60} seconds.`,
-      }),
-      {
-        status: 429,
-        headers: {
-          'Content-Type': 'application/json',
-          'Retry-After': String(minuteBudget.retryAfterSeconds || 60),
-          'X-RateLimit-Remaining': '0',
-        },
-      }
-    );
-  }
-
-  const hourlyBudget = await rateLimit.consumeStrictBudgetWithWindow(
-    `${clientIdentifier}:password-hint-hour`,
-    LIMITS.rateLimit.passwordHintRequestsPerHour,
-    60 * 60
-  );
-  if (!hourlyBudget.allowed) {
-    return new Response(
-      JSON.stringify({
-        error: 'Too many requests',
-        error_description: `Rate limit exceeded. Try again in ${hourlyBudget.retryAfterSeconds || 3600} seconds.`,
-      }),
-      {
-        status: 429,
-        headers: {
-          'Content-Type': 'application/json',
-          'Retry-After': String(hourlyBudget.retryAfterSeconds || 3600),
-          'X-RateLimit-Remaining': '0',
-        },
-      }
-    );
-  }
-
-  const user = await storage.getUser(email);
-  const hint = user?.status === 'active' ? normalizeMasterPasswordHint(user.masterPasswordHint) : null;
-  return jsonResponse({
-    object: 'passwordHint',
-    hasHint: !!hint,
-    masterPasswordHint: hint,
-  });
+  void request;
+  void env;
+  return unsupportedResponse('Password hint delivery is not supported by this server.');
 }
 
 // GET /api/accounts/profile
@@ -1399,6 +1336,11 @@ export async function handleGetTotpRecoveryCode(request: Request, env: Env, user
   });
 }
 
+async function sha256Hex(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 // POST /identity/accounts/recover-2fa
 // Disable TOTP by recovery code + password, then rotate recovery code.
 export async function handleRecoverTwoFactor(request: Request, env: Env): Promise<Response> {
@@ -1426,12 +1368,22 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   if (!clientIdentifier) {
     return errorResponse('Client IP is required', 403);
   }
-  const recoverLimitKey = `${clientIdentifier}:recover-2fa`;
+  const emailHash = await sha256Hex(email || 'anonymous');
+  const ipRecoverLimitKey = `${clientIdentifier}:recover-2fa:${emailHash}`;
+  const accountRecoverLimitKey = `account:recover-2fa:${emailHash}`;
 
-  const recoverAttemptCheck = await rateLimit.checkLoginAttempt(recoverLimitKey);
-  if (!recoverAttemptCheck.allowed) {
+  const ipAttemptCheck = await rateLimit.checkLoginAttempt(ipRecoverLimitKey);
+  if (!ipAttemptCheck.allowed) {
     return errorResponse(
-      `Too many failed recovery attempts. Try again in ${Math.ceil((recoverAttemptCheck.retryAfterSeconds || 60) / 60)} minutes.`,
+      `Too many failed recovery attempts. Try again in ${Math.ceil((ipAttemptCheck.retryAfterSeconds || 60) / 60)} minutes.`,
+      429
+    );
+  }
+
+  const accountAttemptCheck = await rateLimit.checkLoginAttempt(accountRecoverLimitKey);
+  if (!accountAttemptCheck.allowed) {
+    return errorResponse(
+      `Too many failed recovery attempts for this account. Try again in ${Math.ceil((accountAttemptCheck.retryAfterSeconds || 60) / 60)} minutes.`,
       429
     );
   }
@@ -1442,18 +1394,27 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
 
   const user = await storage.getUser(email);
   if (!user || user.status !== 'active') {
-    await rateLimit.recordFailedLogin(recoverLimitKey);
+    await Promise.all([
+      rateLimit.recordFailedLogin(ipRecoverLimitKey),
+      rateLimit.recordFailedLogin(accountRecoverLimitKey),
+    ]);
     return errorResponse('Invalid credentials or recovery code', 400);
   }
 
   const validPassword = await auth.verifyPassword(masterPasswordHash, user.masterPasswordHash, user.email);
   if (!validPassword) {
-    await rateLimit.recordFailedLogin(recoverLimitKey);
+    await Promise.all([
+      rateLimit.recordFailedLogin(ipRecoverLimitKey),
+      rateLimit.recordFailedLogin(accountRecoverLimitKey),
+    ]);
     return errorResponse('Invalid credentials or recovery code', 400);
   }
 
   if (!recoveryCodeEquals(recoveryCode, user.totpRecoveryCode)) {
-    await rateLimit.recordFailedLogin(recoverLimitKey);
+    await Promise.all([
+      rateLimit.recordFailedLogin(ipRecoverLimitKey),
+      rateLimit.recordFailedLogin(accountRecoverLimitKey),
+    ]);
     return errorResponse('Invalid credentials or recovery code', 400);
   }
 
@@ -1474,7 +1435,10 @@ export async function handleRecoverTwoFactor(request: Request, env: Env): Promis
   await storage.saveUser(user);
   await storage.deleteRefreshTokensByUserId(user.id);
   AuthService.invalidateUserCache(user.id);
-  await rateLimit.clearLoginAttempts(recoverLimitKey);
+  await Promise.all([
+    rateLimit.clearLoginAttempts(ipRecoverLimitKey),
+    rateLimit.clearLoginAttempts(accountRecoverLimitKey),
+  ]);
   await safeWriteAuditEvent(env, {
     actorUserId: user.id,
     action: 'account.totp.recover',

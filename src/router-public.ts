@@ -441,6 +441,8 @@ export async function handlePublicRoute(
   }
 
   const publicMailBackedPaths = new Set([
+    '/api/accounts/password-hint',
+    '/accounts/password-hint',
     '/api/accounts/resend-new-device-otp',
     '/accounts/resend-new-device-otp',
     '/api/accounts/register/send-verification-email',
