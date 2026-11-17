@@ -14,7 +14,6 @@ import { buildProfileResponse } from '../utils/profile-response';
 import { isYubiKeyEnabled, isYubiKeyPublicId, requestYubicoApiCredentials, verifyYubicoOtp, yubiKeyPublicIdFromOtp } from '../utils/yubico-otp';
 import {
   getYubicoCredentials,
-  initializeYubicoCredentialsOnce,
   replaceYubicoCredentials,
 } from '../services/yubico-config';
 
@@ -994,8 +993,10 @@ export async function handlePutTwoFactorYubiKey(request: Request, env: Env, user
     readBodyString(body, ['key5', 'Key5']),
   ];
   const publicIds: Array<string | null> = [];
-  let credentials = await getYubicoCredentials(env.DB);
-  let apiKeyBootstrapOtpIndex: number | null = null;
+  const credentials = await getYubicoCredentials(env.DB);
+  if (!credentials) {
+    return errorResponse('Yubico validation credentials are not configured on this server. Contact your administrator.', 400);
+  }
   for (const key of keys) {
     const trimmed = key.trim();
     if (!trimmed) {
@@ -1008,13 +1009,7 @@ export async function handlePutTwoFactorYubiKey(request: Request, env: Env, user
       publicIds.push(publicId);
       continue;
     }
-    if (!credentials) {
-      const initialized = await initializeYubicoCredentialsOnce(env.DB, user.email, trimmed);
-      if (!initialized) return errorResponse('Unable to initialize Yubico validation credentials.', 400);
-      credentials = initialized.credentials;
-      if (initialized.created) apiKeyBootstrapOtpIndex = publicIds.length;
-    }
-    if (apiKeyBootstrapOtpIndex !== publicIds.length && !await verifyYubicoOtp(env, trimmed, credentials)) {
+    if (!await verifyYubicoOtp(env, trimmed, credentials)) {
       return errorResponse('Invalid YubiKey OTP.', 400);
     }
     publicIds.push(publicId);
@@ -1104,36 +1099,19 @@ export async function handleBootstrapTwoFactorYubiKeyConfig(request: Request, en
 
   const otp = readBodyString(body, ['otp', 'OTP', 'token', 'Token']).trim();
   if (!yubiKeyPublicIdFromOtp(otp)) return errorResponse('Invalid YubiKey OTP.', 400);
-  const existing = await getYubicoCredentials(env.DB);
-  if (user.role !== 'admin' && existing) {
-    return errorResponse('Yubico validation credentials are already configured.', 403);
+  if (user.role !== 'admin') {
+    return errorResponse('Only administrators can configure server-wide Yubico credentials.', 403);
   }
 
-  let credentials;
-  if (user.role === 'admin') {
-    credentials = await requestYubicoApiCredentials(user.email, otp);
-    if (!credentials?.clientId || !credentials.secretKey) {
-      return errorResponse('Unable to initialize Yubico validation credentials.', 400);
-    }
-    await replaceYubicoCredentials(env.DB, credentials);
-  } else {
-    const initialized = await initializeYubicoCredentialsOnce(env.DB, user.email, otp);
-    if (!initialized?.created) {
-      return errorResponse(
-        initialized?.credentials
-          ? 'Yubico validation credentials are already configured.'
-          : 'Unable to initialize Yubico validation credentials.',
-        initialized?.credentials ? 403 : 400
-      );
-    }
-    credentials = initialized.credentials;
+  const credentials = await requestYubicoApiCredentials(user.email, otp);
+  if (!credentials?.clientId || !credentials.secretKey) {
+    return errorResponse('Unable to initialize Yubico validation credentials.', 400);
   }
+  await replaceYubicoCredentials(env.DB, credentials);
 
   await writeAuditEvent(storage, {
     actorUserId: user.id,
-    action: user.role === 'admin'
-      ? 'system.yubico.credentials.reconfigure'
-      : 'system.yubico.credentials.initialize',
+    action: 'system.yubico.credentials.reconfigure',
     category: 'security',
     level: 'security',
     targetType: 'system',

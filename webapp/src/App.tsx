@@ -858,7 +858,11 @@ export default function App() {
         loading: false,
         hint: null,
       });
-      pushToast('error', error instanceof Error ? error.message : t('txt_password_hint_load_failed'));
+      openPasswordHintDialog(
+        error instanceof Error
+          ? error.message
+          : t('txt_password_hint_load_failed')
+      );
     }
   }
 

@@ -26,7 +26,7 @@ import { isAuthRequestExpired } from '../services/storage-auth-request-repo';
 import { createPasskeyUserVerificationToken } from '../utils/user-verification-token';
 import { constantTimeEquals, verifyApiKey } from '../utils/api-key';
 import { isYubiKeyEnabled, userYubiKeyPublicIds, verifyYubicoOtp, yubiKeyPublicIdFromOtp } from '../utils/yubico-otp';
-import { getYubicoCredentials, initializeYubicoCredentialsOnce } from '../services/yubico-config';
+import { getYubicoCredentials } from '../services/yubico-config';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
@@ -493,17 +493,11 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
         if (!publicId || !effectiveYubiKeyPublicIds.includes(publicId)) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
-        let credentials = await getYubicoCredentials(env.DB);
-        let initializedWithCurrentOtp = false;
+        const credentials = await getYubicoCredentials(env.DB);
         if (!credentials) {
-          const initialized = await initializeYubicoCredentialsOnce(env.DB, user.email, normalizedTwoFactorToken);
-          if (!initialized) {
-            return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
-          }
-          credentials = initialized.credentials;
-          initializedWithCurrentOtp = initialized.created;
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
-        if (!initializedWithCurrentOtp && !await verifyYubicoOtp(env, normalizedTwoFactorToken, credentials)) {
+        if (!await verifyYubicoOtp(env, normalizedTwoFactorToken, credentials)) {
           return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
         }
       } else if (normalizedTwoFactorProvider === String(TWO_FACTOR_PROVIDER_WEBAUTHN)) {

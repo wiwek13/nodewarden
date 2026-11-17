@@ -400,7 +400,7 @@ export async function handlePublicRoute(
   }
 
   if (path === '/api/devices/knowndevice' && method === 'GET') {
-    const blocked = await enforcePublicRateLimit();
+    const blocked = await enforcePublicRateLimit('public-sensitive', LIMITS.rateLimit.sensitivePublicRequestsPerMinute);
     if (blocked) return jsonResponse(false);
     return handleKnownDevice(request, env);
   }
